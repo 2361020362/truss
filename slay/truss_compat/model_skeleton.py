@@ -26,9 +26,10 @@ class Model:
         )
 
     # Below illustrated code will be added by code generation.
+
     # def load(self):
     #     self._processor = {ProcssorCls}(self._context)
 
-    # Sync async.
+    # Sync or async.
     # def predict(self, payload):
     #     return self._processor.{method_name}(payload)

@@ -12,7 +12,7 @@ import libcst
 # from rope.refactor import move as rope_move
 # from rope.refactor import occurrences as rope_occurrences
 from slay import definitions, utils
-from slay.truss_compat import model_skeleton
+from slay.truss_compat import code_gen
 
 INDENT = " " * 4
 
@@ -23,6 +23,31 @@ PROCESSOR_MODULE = "processor"
 
 def _indent(text: str) -> str:
     return textwrap.indent(text, INDENT)
+
+
+class _MainRemover(ast.NodeTransformer):
+    def visit_If(self, node):
+        """Robustly matches variations of `if __name__ == "__main__":`."""
+        if (
+            isinstance(node.test, ast.Compare)
+            and any(
+                isinstance(c, ast.Name) and c.id == "__name__"
+                for c in ast.walk(node.test.left)
+            )
+            and any(
+                isinstance(c, ast.Constant) and c.value == "__main__"
+                for c in ast.walk(node.test)
+            )
+        ):
+            return None
+        return self.generic_visit(node)
+
+
+def _remove_main_section(source_code: str) -> str:
+    parsed_code = ast.parse(source_code)
+    transformer = _MainRemover()
+    transformed_ast = transformer.visit(parsed_code)
+    return ast.unparse(transformed_ast)
 
 
 def _run_simple_subprocess(cmd: str) -> None:
@@ -184,32 +209,7 @@ def generate_stubs_for_deps(
     _format_python_file(out_file_path)
 
 
-# Remote Model Gen #####################################################################
-
-
-class _MainRemover(ast.NodeTransformer):
-    def visit_If(self, node):
-        """Robustly matches variations of `if __name__ == "__main__":`."""
-        if (
-            isinstance(node.test, ast.Compare)
-            and any(
-                isinstance(c, ast.Name) and c.id == "__name__"
-                for c in ast.walk(node.test.left)
-            )
-            and any(
-                isinstance(c, ast.Str) and c.s in ("__main__", "__main__")
-                for c in ast.walk(node.test)
-            )
-        ):
-            return None
-        return self.generic_visit(node)
-
-
-def _remove_main_section(source_code):
-    parsed_code = ast.parse(source_code)
-    transformer = _MainRemover()
-    transformed_ast = transformer.visit(parsed_code)
-    return ast.unparse(transformed_ast)
+# Remote Processor Gen #################################################################
 
 
 class _InitRewriter(libcst.CSTTransformer):
@@ -303,157 +303,6 @@ def _rewrite_processor_inits(
     return modified_tree
 
 
-# def _rope_find_def_offset(project, source_module, symbol_name):
-#     finder = rope_occurrences.Finder(project, symbol_name)
-#     offset = -1
-#     occurrences = finder.find_occurrences(source_module)
-#     for occurrence in occurrences:
-#         if occurrence.is_defined():
-#             if offset >= 0:
-#                 raise ValueError("Multiple found")
-#             offset = occurrence.offset
-#     if offset < 0:
-#         raise ValueError("Not found")
-#     return offset
-
-
-# def move_class_to_new_file(
-#     project_root,
-#     source_file_path,
-#     target_file_path,
-#     class_name,
-# ):
-#     logging.info(f"Moving`{class_name}` dedicated model file.")
-#     # TODO: all of this is totally unclear.
-#     project = rope_project.Project(project_root, ropefolder=None)
-#     source_module = project.get_resource(source_file_path)
-
-#     offset = _rope_find_def_offset(project, source_module, class_name)
-
-#     target_file = project.get_file(target_file_path)
-#     if target_file.exists():
-#         target_file.remove()
-#     target_file.create()
-
-#     target_resource = project.get_resource(target_file_path)
-
-#     print(f"Moving `{class_name}` to `{target_file_path}`.")
-#     move_refactoring = rope_move.create_move(project, source_module, offset)
-
-#     changes = move_refactoring.get_changes(dest=target_resource)
-#     # TODO: move other needed stuff from source module - so we can get rid of it?
-#     project.do(changes)
-
-
-class _ChangeProcessorAnnotation(libcst.CSTTransformer):
-    def __init__(self, new_annotaiton: str) -> None:
-        super().__init__()
-        self._new_annotaiton = new_annotaiton
-
-    def leave_SimpleStatementLine(
-        self,
-        original_node: libcst.SimpleStatementLine,
-        updated_node: libcst.SimpleStatementLine,
-    ) -> libcst.SimpleStatementLine:
-        new_body: list[Any] = []
-        for statement in updated_node.body:
-            if (
-                isinstance(statement, libcst.AnnAssign)
-                and isinstance(statement.target, libcst.Name)
-                and statement.target.value == "_processor"
-            ):
-                new_annotation = libcst.Annotation(
-                    annotation=libcst.Name(value=self._new_annotaiton)
-                )
-                new_statement = statement.with_changes(annotation=new_annotation)
-                new_body.append(new_statement)
-            else:
-                new_body.append(statement)
-
-        return updated_node.with_changes(body=tuple(new_body))
-
-
-def _generate_baseten_model(processor_desrciptor: definitions.ProcessorAPIDescriptor):
-    logging.info(f"Generating Baseten model for `{processor_desrciptor.cls_name}`.")
-    remote_tree = libcst.parse_module(pathlib.Path(model_skeleton.__file__).read_text())
-
-    new_imports = [
-        node
-        for node in remote_tree.body
-        if isinstance(node, libcst.SimpleStatementLine)
-        and any(
-            isinstance(stmt, libcst.Import) or isinstance(stmt, libcst.ImportFrom)
-            for stmt in node.body
-        )
-    ]
-
-    class_definition = utils.expect_one(
-        node
-        for node in remote_tree.body
-        if isinstance(node, libcst.ClassDef) and node.name.value == "Model"
-    )
-
-    load_def = libcst.parse_statement(
-        f"""
-def load(self) -> None:
-    self._processor = {processor_desrciptor.cls_name}(context=self._context)
-"""
-    )
-
-    endpoint_descriptor = processor_desrciptor.endpoint
-    def_str = "async def" if endpoint_descriptor.is_async else "def"
-    # Convert json payload dict to processor args.
-    obj_arg_parts = ", ".join(
-        (
-            f"{arg_name}={arg_type.as_src_str()}.parse_obj(payload['{arg_name}'])"
-            if arg_type.is_pydantic
-            else f"{arg_name}=payload['{arg_name}']"
-        )
-        for arg_name, arg_type in endpoint_descriptor.input_names_and_tyes
-    )
-
-    if len(endpoint_descriptor.output_types) == 1:
-        output_type = endpoint_descriptor.output_types[0]
-        result = "result.dict()" if output_type.is_pydantic else "result"
-    else:
-        result_parts = [
-            f"result[{i}].dict()" if t.is_pydantic else f"result[{i}]"
-            for i, t in enumerate(endpoint_descriptor.output_types)
-        ]
-        result = f"({', '.join(result_parts)})"
-
-    maybe_await = "await " if endpoint_descriptor.is_async else ""
-
-    predict_def = libcst.parse_statement(
-        f"""
-{def_str} predict(self, payload):
-    result = {maybe_await}self._processor.{endpoint_descriptor.name}({obj_arg_parts})
-    return  {result}
-
-"""
-    )
-    new_body: list[libcst.BaseStatement] = list(  # type: ignore[assignment,misc]
-        class_definition.body.body
-    ) + [
-        load_def,
-        predict_def,
-    ]
-    new_block = libcst.IndentedBlock(body=new_body)
-    class_definition = class_definition.with_changes(body=new_block)
-    class_definition = class_definition.visit(  # type: ignore[assignment]
-        _ChangeProcessorAnnotation(processor_desrciptor.cls_name)
-    )
-
-    if issubclass(processor_desrciptor.user_config_type.raw, type(None)):
-        userconfig_pin = libcst.parse_statement("UserConfigT = None")
-    else:
-        userconfig_pin = libcst.parse_statement(
-            f"UserConfigT = {processor_desrciptor.user_config_type.as_src_str()}"
-        )
-
-    return class_definition, new_imports, userconfig_pin
-
-
 ########################################################################################
 
 
@@ -468,7 +317,9 @@ def generate_processor_source(
     # TODO: Processor isolation: either prune file or generate a new file.
     # At least remove main section.
 
-    model_def, imports, userconfig_pin = _generate_baseten_model(processor_desrciptor)
+    model_def, imports, userconfig_pin = code_gen.generate_truss_model(
+        processor_desrciptor
+    )
     new_body: list[libcst.BaseStatement] = (  # type: ignore[assignment, misc]
         imports + list(source_tree.body) + [userconfig_pin, model_def]
     )

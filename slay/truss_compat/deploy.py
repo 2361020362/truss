@@ -15,6 +15,8 @@ from truss import truss_config
 from truss.remote import remote_factory, truss_remote
 from truss.remote.baseten import service as b10_service
 
+_REQUIREMENTS_FILE_NAME = "pip_requirements.txt"
+
 
 def _make_truss_config(
     truss_dir: pathlib.Path,
@@ -47,10 +49,12 @@ def _make_truss_config(
     pip_requirements.extend(image.pip_requirements)
     # This will add server requirements which give version conflicts.
     # config.requirements = pip_requirements
-    pip_requirements_file_path = truss_dir / "gen_requirements.txt"
+    pip_requirements_file_path = truss_dir / _REQUIREMENTS_FILE_NAME
     pip_requirements_file_path.write_text("\n".join(pip_requirements))
     # TODO: apparently absolute paths don't work with remote build (but work in local).
-    config.requirements_file = "gen_requirements.txt"  # str(pip_requirements_file_path)
+    config.requirements_file = (
+        _REQUIREMENTS_FILE_NAME  # str(pip_requirements_file_path)
+    )
     config.system_packages = image.apt_requirements
 
     # Assets.
@@ -80,7 +84,7 @@ def make_truss(
     processor_desrciptor: definitions.ProcessorAPIDescriptor,
     stub_cls_to_url: Mapping[str, str],
 ) -> pathlib.Path:
-    # TODO: Handle if model uses truss config instead of `defautl_config`.
+    # TODO: Handle if model uses truss config instead of `default_config`.
     # TODO: Handle file-based overrides when deploying.
 
     truss_dir = processor_dir / "truss"
@@ -199,10 +203,7 @@ class BasetenClient:
                 name
                 versions{{
                     id
-                    semver
                     current_deployment_status
-                    truss_hash
-                    truss_signature
                 }}
             }}
         }}

@@ -46,7 +46,9 @@ def _validate_io_type(anno) -> None:
         try:
             anno.schema()
         except Exception as e:
-            raise definitions.APIDefinitonError() from e
+            raise definitions.APIDefinitonError(
+                "Pydantic annotations must be cable to generate a schema. Please fix."
+            ) from e
         return
 
     raise definitions.APIDefinitonError(anno)
